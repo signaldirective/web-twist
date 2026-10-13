@@ -1,0 +1,131 @@
+/* The popup dresses itself in whatever palette is active, so it looks like the
+   desktop even though it never sees a page. Every alias has a fallback so the
+   popup is still legible before the first palette arrives. */
+
+:root {
+  --bg:        var(--webtwist-background,         #101913);
+  --bg-dark:   var(--webtwist-dark-background,    #0c130e);
+  --bg-light:  var(--webtwist-lighter-background, #28302b);
+  --fg:        var(--webtwist-foreground,         #a1af9c);
+  --fg-dim:    var(--webtwist-dark-foreground,    #798375);
+  --accent:    var(--webtwist-accent,             #4a9a68);
+  --mono: "CaskaydiaMono Nerd Font", "JetBrainsMono Nerd Font", "Fira Code",
+          ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 280px;
+  margin: 0;
+  padding: 12px;
+  background: var(--bg-dark);
+  color: var(--fg);
+  font: 12px/1.5 var(--mono);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.head img { border-radius: 4px; }
+.head .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  color: var(--accent);
+}
+.head .mode {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: var(--bg);
+  white-space: nowrap;
+}
+.head .mode.desktop { color: var(--accent); }
+.head .mode.fallback { color: var(--webtwist-yellow, #c4a64e); }
+
+.swatches {
+  display: flex;
+  gap: 3px;
+  margin-bottom: 12px;
+}
+.swatches .chip {
+  flex: 1;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--bg-light);
+}
+
+.palette { margin-bottom: 12px; }
+.palette .label {
+  margin-bottom: 6px;
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.pchip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--bg-light);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.pchip:hover { border-color: var(--accent); }
+.pchip.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg-dark);
+  font-weight: 700;
+}
+.pstrip { display: flex; gap: 1px; }
+.pstrip i {
+  width: 6px;
+  height: 10px;
+  border-radius: 1px;
+}
+.hint {
+  margin: 7px 0 0;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--bg-light);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+}
+.toggle input { accent-color: var(--accent); margin: 0; }
+.toggle input:disabled + span { color: var(--fg-dim); }
+
+.status {
+  margin: 9px 2px 0;
+  min-height: 1.5em;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.status.ok { color: var(--accent); }
+.status.err { color: var(--webtwist-red, #c87a5c); }

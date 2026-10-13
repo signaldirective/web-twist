@@ -1,0 +1,89 @@
+/* ==UserStyle==
+@name           Webtwist — starter
+@namespace      signaldirective.github.io/webtwist
+@version        1.0.0
+@description    A starter userstyle that reads the --webtwist-* variables Webtwist adds to every page. Use it as a base for sites you want to restyle by hand: the colors stay in sync with your desktop and retint on a theme switch with no reload.
+@author         Webtwist
+@license        MIT
+@homepageURL    https://github.com/omacom/omarchy-theme-sync
+@supportURL     https://github.com/omacom/omarchy-theme-sync/issues
+==/UserStyle== */
+
+/* How this works
+ * --------------
+ * The extension writes the current palette onto <html> as --webtwist-<color>
+ * variables, and the mode as data-webtwist-mode. A Stylus style lives in the same
+ * document, so it can read both and re-resolves the moment the desktop theme
+ * changes. Nothing here is baked in; there is only one copy of the palette.
+ *
+ * The variable names come from the theme's colors.toml, with underscores turned
+ * into hyphens: `bright_green` is `--webtwist-bright-green`.
+ *
+ * Every rule below carries a fallback so the style still looks deliberate when
+ * the extension is not installed.
+ *
+ * The built-in auto-theme already handles most sites. Reach for this style when
+ * a single site needs a hand-written look -- and turn that site's built-in
+ * theming off from the extension popup first, because the engine's overrides
+ * take precedence over ordinary style rules.
+ */
+
+@-moz-document url-prefix("http") {
+  :root {
+    --om-bg:        var(--webtwist-background,         #101913);
+    --om-bg-dark:   var(--webtwist-dark-background,    #0c130e);
+    --om-bg-darker: var(--webtwist-darker-background,  #080d0a);
+    --om-bg-light:  var(--webtwist-lighter-background, #28302b);
+    --om-fg:        var(--webtwist-foreground,         #a1af9c);
+    --om-fg-dim:    var(--webtwist-dark-foreground,    #798375);
+    --om-fg-bright: var(--webtwist-bright-foreground,  #b9c3b5);
+    --om-accent:    var(--webtwist-accent,             #4a9a68);
+    --om-selection: var(--webtwist-selection,          #28302b);
+    --om-muted:     var(--webtwist-muted,              #4a684a);
+  }
+
+  /* Follow the desktop's light or dark choice for scrollbars and controls. */
+  html[data-webtwist-mode="dark"] { color-scheme: dark; }
+  html[data-webtwist-mode="light"] { color-scheme: light; }
+
+  body,
+  main,
+  #content,
+  #page {
+    background-color: var(--om-bg) !important;
+    color: var(--om-fg) !important;
+  }
+
+  a,
+  a:visited { color: var(--om-accent) !important; }
+
+  ::selection {
+    background-color: var(--om-selection) !important;
+    color: var(--om-fg) !important;
+  }
+
+  input,
+  textarea,
+  select,
+  button {
+    background-color: var(--om-bg-dark) !important;
+    color: var(--om-fg) !important;
+    border-color: var(--om-bg-light) !important;
+  }
+  ::placeholder { color: var(--om-fg-dim) !important; }
+
+  /* Code and quoted blocks read as recessed panels in the palette. */
+  pre,
+  code,
+  blockquote {
+    background-color: var(--om-bg-darker) !important;
+    color: var(--om-fg-bright) !important;
+    border-color: var(--om-bg-light) !important;
+  }
+
+  hr { border-color: var(--om-bg-light) !important; }
+
+  /* Replace the selectors below with the ones the site actually uses. A quick
+     way to find them: right-click the element, Inspect, and read the class names
+     in the Styles panel while toggling the built-in theming on and off. */
+}

@@ -1,0 +1,471 @@
+#!/bin/bash
+
+# omarchy:summary=Native messaging host: stream the current theme palette to the browser extension
+# omarchy:hidden=true
+
+# No `set -e`: this is a long-lived port. A failed read or a theme directory that
+# briefly does not exist mid-swap must not take the host down, or the extension
+# loses the palette until the browser restarts.
+set -uo pipefail
+
+# jq -a keeps every payload pure ASCII, so the 4-byte length prefix can be
+# computed from ${#payload} without the locale deciding whether that counts
+# bytes or characters. A theme name with an accent in it would otherwise be
+# framed one byte short and desync the port for good.
+export LC_ALL=C
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+
+# The browser launches us with none of Omarchy's environment. Deriving
+# OMARCHY_PATH from our own location only works for a host that lives inside the
+# Omarchy tree; this one ships from its own repo, where ../themes does not exist.
+# omarchy-theme-set resolves themes through $OMARCHY_PATH/themes, so an
+# unverified guess here would make every apply fail with "theme does not exist".
+resolve_omarchy_path() {
+  local derived
+
+  if [[ -n ${OMARCHY_PATH:-} && -d $OMARCHY_PATH/themes ]]; then
+    export OMARCHY_PATH
+    return
+  fi
+
+  derived=$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd)
+  if [[ -d $derived/themes && -d $derived/bin ]]; then
+    export OMARCHY_PATH="$derived"
+  else
+    export OMARCHY_PATH=/usr/share/omarchy
+  fi
+}
+
+resolve_omarchy_path
+export PATH="$OMARCHY_PATH/bin:/usr/local/bin:/usr/bin:$PATH"
+
+STATE_DIR="$HOME/.local/state/omarchy/current"
+COLORS_FILE="$STATE_DIR/theme/colors.toml"
+NAME_FILE="$STATE_DIR/theme.name"
+
+MAX_REQUEST_BYTES=12582912
+MAX_RESPONSE_BYTES=1048576
+MAX_PALETTE_BYTES=65536
+MAX_THEME_NAME_CHARS=64
+MAX_COLORS=128
+
+# Every frame written to stdout takes this lock. The inotify loop and the stdin
+# reader are separate processes sharing one stdout, and a length prefix
+# interleaved with another message's body desyncs the port permanently. Each
+# emit opens the file fresh so parent and child get distinct open file
+# descriptions -- reusing one inherited fd would be the same lock to both and
+# exclude nothing.
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/webtwist-host.$$.lock"
+
+cleanup() { rm -f "$LOCK_FILE"; }
+trap cleanup EXIT
+
+# colors.toml is a flat `key = "value"` table. Anything that is not that shape
+# (the `mode` line aside, which is the same shape) is not colour and is skipped
+# rather than guessed at.
+palette_json() {
+  [[ -f $COLORS_FILE ]] || { printf '{}'; return; }
+
+  local source
+  source=$(head -c "$((MAX_PALETTE_BYTES + 1))" -- "$COLORS_FILE" && printf '.') || { printf '{}'; return; }
+  source=${source%.}
+  (( ${#source} <= MAX_PALETTE_BYTES )) || { printf '{}'; return; }
+
+  printf '%s' "$source" |
+    sed -n 's/^[[:space:]]*\([a-z_][a-z0-9_]*\)[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1\t\2/p' |
+    jq -R -s -a 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): .[1]}) | add // {}' 2>/dev/null ||
+    printf '{}'
+}
+
+theme_message() {
+  local name=""
+  if [[ -f $NAME_FILE ]]; then
+    name=$(head -c "$MAX_THEME_NAME_CHARS" -- "$NAME_FILE")
+    name=${name%%$'\n'*}
+  fi
+
+  palette_json | jq -c -a --arg name "$name" \
+    '{type: "palette", name: $name, mode: (.mode // "dark"), colors: del(.mode)}' 2>/dev/null
+}
+
+emit() {
+  local payload=$1 len
+  len=${#payload}
+  (( len > 0 && len <= MAX_RESPONSE_BYTES )) || return 0
+
+  {
+    flock 9 || return 1
+    # Native messaging frame: 4-byte little-endian length, then UTF-8 JSON.
+    printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+      $((len & 255)) $(((len >> 8) & 255)) $(((len >> 16) & 255)) $(((len >> 24) & 255)))"
+    printf '%s' "$payload"
+  } 9>"$LOCK_FILE"
+}
+
+emit_palette() {
+  local message
+  message=$(theme_message) || return 0
+  emit "$message"
+}
+
+# Applying a theme restarts terminals and regenerates every template, so a page
+# looping requests would thrash the session. This is the privileged end of the
+# pipe, so the limit lives here where a compromised extension cannot skip it.
+MIN_APPLY_INTERVAL=2
+
+# omarchy-theme-set lowercases, hyphenates and strips tags before it looks a
+# theme up. Normalising the same way here means the allowlist below compares
+# like for like -- "Tokyo Night" and "tokyo-night" are the same theme.
+normalize_theme() {
+  printf '%s' "$1" | sed -E 's/<[^>]+>//g' | tr '[:upper:]' '[:lower:]' | tr ' ' '-'
+}
+
+# The allowlist is the set of themes actually installed, enumerated at request
+# time. A name that is not a member never reaches omarchy-theme-set, so a page
+# cannot reach for a path, a traversal, or an uninstalled theme.
+theme_installed() {
+  local want=$1 line
+  while IFS= read -r line; do
+    [[ $(normalize_theme "$line") == "$want" ]] && return 0
+  done < <(omarchy-theme-list 2>/dev/null)
+  return 1
+}
+
+reply_result() {
+  local id=$1 ok=$2 name=$3 error=$4
+  emit "$(jq -c -a -n --arg id "$id" --argjson ok "$ok" --arg name "$name" --arg error "$error" \
+    '{type: "theme-result", id: $id, ok: $ok, name: $name, error: $error}' 2>/dev/null)"
+}
+
+# last_apply is a local of read_requests; bash's dynamic scoping lets this see
+# and update it, which is what keeps the rate limit stateful across requests.
+apply_theme() {
+  local raw=$1 id=$2 name now
+
+  name=$(normalize_theme "$raw")
+
+  if [[ ! $name =~ ^[a-z0-9_][a-z0-9._+-]*$ ]] || (( ${#name} > MAX_THEME_NAME_CHARS )); then
+    reply_result "$id" false "$raw" "invalid theme name"
+    return
+  fi
+
+  if ! theme_installed "$name"; then
+    reply_result "$id" false "$raw" "theme not installed"
+    return
+  fi
+
+  now=$(date +%s)
+  if (( now - last_apply < MIN_APPLY_INTERVAL )); then
+    reply_result "$id" false "$name" "rate limited"
+    return
+  fi
+  last_apply=$now
+
+  # Detached: omarchy-theme-set takes seconds (templates, terminal reloads), and
+  # running it inline would block this port and stall palette pushes to every
+  # other tab. The caller learns it succeeded from the palette that follows.
+  setsid -f omarchy-theme-set "$name" </dev/null >/dev/null 2>&1
+  reply_result "$id" true "$name" ""
+}
+
+USER_THEMES_DIR="$HOME/.config/omarchy/themes"
+MAX_IMAGE_BYTES=8388608
+MAX_IMAGE_BASE64_CHARS=$(((MAX_IMAGE_BYTES + 2) / 3 * 4))
+MIN_INSTALL_INTERVAL=2
+MAX_BROWSER_THEMES=64
+MAX_BROWSER_THEME_BYTES=268435456
+INSTALL_STATE_DIR="$HOME/.local/state/omarchy/browser-theme-host"
+THEME_MARKER=".omarchy-browser-theme"
+
+# Installing writes a theme directory that omarchy-theme-set will later copy
+# wholesale. Omarchy reads a plain directory under ~/.config/omarchy/themes as
+# "the user wrote this themselves" and stages everything in it, .lua included --
+# only a theme carrying a .git directory is treated as coming from a stranger and
+# filtered. A directory built here is plain, so it would inherit that trust on a
+# web page's behalf.
+#
+# Rather than filter what the page sends, nothing the page names is ever written:
+# the only content files created are a colors.toml rebuilt from validated hex
+# pairs and one signature-checked image, plus a fixed quota marker.
+# There is nothing executable in the result by construction,
+# and the 17 generated configs (hyprland.lua and the other Lua included) come
+# from Omarchy's own templates, driven by that colors.toml.
+install_theme() {
+  local id=$1 payload=$2
+  local raw slug target
+
+  raw=$(jq -r '.name // ""' <<<"$payload" 2>/dev/null)
+  slug=$(normalize_theme "$raw")
+
+  if [[ ! $slug =~ ^[a-z0-9_][a-z0-9._+-]*$ ]] || (( ${#slug} > MAX_THEME_NAME_CHARS )); then
+    reply_result "$id" false "$raw" "unusable theme name"
+    return
+  fi
+
+  target="$USER_THEMES_DIR/$slug"
+
+  # A transaction-local fd and EXIT trap keep both cleanup and the cross-host
+  # lock out of the detached setter. Never unlink the persistent lock inode.
+  if ! (
+    umask 077
+    staging="" stamp_tmp=""
+    trap '[[ -z $staging ]] || rm -rf -- "$staging"; [[ -z $stamp_tmp ]] || rm -f -- "$stamp_tmp"' EXIT
+    trap 'exit 1' TERM INT HUP PIPE
+
+    if [[ -L $INSTALL_STATE_DIR ]] || ! mkdir -p -m 0700 -- "$INSTALL_STATE_DIR" ||
+      [[ ! -O $INSTALL_STATE_DIR || $(stat -c%a -- "$INSTALL_STATE_DIR") != 700 ]]; then
+      reply_result "$id" false "$slug" "unsafe install state directory"
+      exit 1
+    fi
+    for file in install.lock last-install .last-install.tmp; do
+      file="$INSTALL_STATE_DIR/$file"
+      if [[ -L $file || ( -e $file && ( ! -f $file || ! -O $file ) ) ]]; then
+        reply_result "$id" false "$slug" "unsafe install state file"
+        exit 1
+      fi
+    done
+    if ! exec 8>>"$INSTALL_STATE_DIR/install.lock"; then
+      reply_result "$id" false "$slug" "cannot open install lock"
+      exit 1
+    fi
+    if ! flock -n 8; then
+      reply_result "$id" false "$slug" "installation busy"
+      exit 1
+    fi
+
+    last_install=0
+    if [[ -e $INSTALL_STATE_DIR/last-install ]]; then
+      stamp_size=$(stat -c%s -- "$INSTALL_STATE_DIR/last-install")
+      if [[ ! $stamp_size =~ ^[0-9]{1,2}$ ]] || (( stamp_size > 13 )) ||
+        ! IFS= read -r last_install <"$INSTALL_STATE_DIR/last-install" ||
+        [[ ! $last_install =~ ^(0|[1-9][0-9]{0,11})$ ]] || (( stamp_size != ${#last_install} + 1 )); then
+        reply_result "$id" false "$slug" "invalid install timestamp"
+        exit 1
+      fi
+    fi
+    now=$(date +%s)
+    if [[ ! $now =~ ^[1-9][0-9]{0,11}$ ]]; then
+      reply_result "$id" false "$slug" "cannot read install clock"
+      exit 1
+    fi
+    if (( now - last_install < MIN_INSTALL_INTERVAL )); then
+      reply_result "$id" false "$slug" "installation rate limited"
+      exit 1
+    fi
+    # Persist admission before any theme writes, including attempts that fail.
+    stamp_tmp="$INSTALL_STATE_DIR/.last-install.tmp"
+    if ! printf '%s\n' "$now" >"$stamp_tmp" ||
+      ! mv -fT -- "$stamp_tmp" "$INSTALL_STATE_DIR/last-install"; then
+      reply_result "$id" false "$slug" "cannot persist install timestamp"
+      exit 1
+    fi
+    stamp_tmp=""
+
+    if [[ -e $target || -L $target || -e $OMARCHY_PATH/themes/$slug || -L $OMARCHY_PATH/themes/$slug ]]; then
+      reply_result "$id" false "$slug" "theme already exists; use setTheme"
+      exit 1
+    fi
+    if ! mkdir -p -- "$USER_THEMES_DIR"; then
+      reply_result "$id" false "$slug" "cannot create themes directory"
+      exit 1
+    fi
+
+    count=0 bytes=0
+    # Abandoned staging directories (e.g. after SIGKILL) retain quota too, so
+    # reconnects cannot turn interrupted installs into unaccounted storage.
+    for entry in "$USER_THEMES_DIR"/* "$USER_THEMES_DIR"/.omarchy-browser-stage.??????????; do
+      [[ -d $entry && ! -L $entry ]] || continue
+      if [[ $entry != "$USER_THEMES_DIR"/.omarchy-browser-stage.?????????? ]]; then
+        marker="$entry/$THEME_MARKER"
+        [[ -e $marker || -L $marker ]] || continue
+        if [[ ! -f $marker || -L $marker || $(stat -c%s -- "$marker") != 2 ]] ||
+          ! IFS= read -r marker_version <"$marker" || [[ $marker_version != 1 ]]; then
+          reply_result "$id" false "$slug" "invalid browser theme marker"
+          exit 1
+        fi
+      fi
+      size=$(du -sb -- "$entry") || {
+        reply_result "$id" false "$slug" "cannot measure theme quota"
+        exit 1
+      }
+      size=${size%%$'\t'*}
+      if [[ ! $size =~ ^[0-9]{1,15}$ ]] || (( size > MAX_BROWSER_THEME_BYTES )); then
+        reply_result "$id" false "$slug" "browser theme quota exceeded"
+        exit 1
+      fi
+      (( count += 1, bytes += size ))
+      if (( count >= MAX_BROWSER_THEMES || bytes >= MAX_BROWSER_THEME_BYTES )); then
+        reply_result "$id" false "$slug" "browser theme quota exceeded"
+        exit 1
+      fi
+    done
+
+    staging=$(mktemp -d "$USER_THEMES_DIR/.omarchy-browser-stage.XXXXXXXXXX") || {
+      reply_result "$id" false "$slug" "cannot create staging directory"
+      exit 1
+    }
+    if ! jq -r '.colors | to_entries[] | "\(.key) = \"\(.value | ascii_downcase)\""' <<<"$payload" >"$staging/colors.toml" ||
+      ! printf '1\n' >"$staging/$THEME_MARKER"; then
+      reply_result "$id" false "$slug" "cannot write theme palette"
+      exit 1
+    fi
+
+    image_b64=$(jq -r '.background // ""' <<<"$payload")
+    if [[ -n $image_b64 ]]; then
+      if ! mkdir -- "$staging/backgrounds" ||
+        ! base64 -d <<<"$image_b64" >"$staging/backgrounds/image.bin" 2>/dev/null; then
+        reply_result "$id" false "$slug" "background is not valid base64 or cannot be written"
+        exit 1
+      fi
+      size=$(stat -c%s -- "$staging/backgrounds/image.bin")
+      if [[ ! $size =~ ^[0-9]{1,9}$ ]] || (( size == 0 || size > MAX_IMAGE_BYTES )); then
+        reply_result "$id" false "$slug" "background is empty or larger than 8MB"
+        exit 1
+      fi
+      magic=$(od -An -tx1 -N8 -v "$staging/backgrounds/image.bin" | tr -d ' \n')
+      case $magic in
+        ffd8ff*) image_ext=jpg ;;
+        89504e470d0a1a0a) image_ext=png ;;
+        *) reply_result "$id" false "$slug" "background is not a JPEG or PNG"; exit 1 ;;
+      esac
+      if ! mv -T -- "$staging/backgrounds/image.bin" "$staging/backgrounds/$slug.$image_ext"; then
+        reply_result "$id" false "$slug" "cannot name theme background"
+        exit 1
+      fi
+    fi
+
+    size=$(du -sb -- "$staging") || {
+      reply_result "$id" false "$slug" "cannot measure theme quota"
+      exit 1
+    }
+    size=${size%%$'\t'*}
+    if [[ ! $size =~ ^[0-9]{1,15}$ ]] || (( bytes + size > MAX_BROWSER_THEME_BYTES )); then
+      reply_result "$id" false "$slug" "browser theme quota exceeded"
+      exit 1
+    fi
+    # -n may return success after skipping a competing target. The source must
+    # disappear too. --no-copy forbids a non-atomic cross-filesystem fallback.
+    if ! chmod 0755 "$staging" || ! mv --no-copy -nT -- "$staging" "$target" || [[ -e $staging || -L $staging ]]; then
+      reply_result "$id" false "$slug" "cannot publish theme without overwriting"
+      exit 1
+    fi
+    staging=""
+  ); then
+    return
+  fi
+
+  local now
+  now=$(date +%s)
+  if (( now - last_apply < MIN_APPLY_INTERVAL )); then
+    # Installed, but not applied: say so rather than claim a switch happened.
+    reply_result "$id" true "$slug" "installed, not applied (rate limited)"
+    return
+  fi
+  last_apply=$now
+
+  setsid -f omarchy-theme-set "$slug" </dev/null >/dev/null 2>&1
+  reply_result "$id" true "$slug" ""
+}
+
+# EOF is the browser closing the port, and is the only shutdown signal we get;
+# without acting on it the host would sit watching the theme forever after the
+# browser is gone.
+read_requests() {
+  local header length payload type name id last_apply=0
+
+  while true; do
+    header=$(head -c4 | od -An -v -tx1 | tr -d ' \n') || break
+    [[ ${#header} == 8 ]] || break
+    length=$((16#${header:6:2}${header:4:2}${header:2:2}${header:0:2}))
+    (( length > 0 && length <= MAX_REQUEST_BYTES )) || break
+    # The sentinel preserves trailing newlines; Bash drops NUL bytes, which
+    # also makes the exact byte-count check fail instead of accepting them.
+    payload=$(head -c "$length" && printf '.') || break
+    payload=${payload%.}
+    (( ${#payload} == length )) || break
+    jq -e -s 'length == 1 and (.[0] | type == "object")' <<<"$payload" >/dev/null 2>&1 || break
+
+    id=$(jq -r 'if (.id | type == "string") and (.id | length <= 64) and
+      (.id | test("[[:cntrl:]]") | not) then .id else "" end' <<<"$payload")
+    if ! jq -e --argjson max_name "$MAX_THEME_NAME_CHARS" --argjson max_colors "$MAX_COLORS" \
+      --argjson max_image "$MAX_IMAGE_BASE64_CHARS" '
+      def name_ok: type == "string" and length > 0 and length <= $max_name and (test("[[:cntrl:]]") | not);
+      def id_ok: type == "string" and length <= 64 and (test("[[:cntrl:]]") | not);
+      def colors_ok:
+        type == "object" and length <= $max_colors and
+        has("background") and has("foreground") and has("accent") and
+        all(to_entries[];
+          (.key | test("\\A[a-z][a-z0-9_]{0,31}\\z")) and
+          (.value | type == "string" and test("\\A#[0-9a-fA-F]{6}\\z")));
+      if .type == "set-theme" then
+        (.id | id_ok) and (.name | name_ok) and ((keys - ["type", "id", "name"]) | length == 0)
+      elif .type == "install-theme" then
+        (.id | id_ok) and (.name | name_ok) and (.colors | colors_ok) and
+        ((has("background") | not) or (.background | type == "string" and length <= $max_image and index("\u0000") == null)) and
+        ((keys - ["type", "id", "name", "colors", "background"]) | length == 0)
+      else . == {} or . == {type: "get-palette"}
+      end' <<<"$payload" >/dev/null 2>&1; then
+      reply_result "$id" false "" "invalid request schema"
+      continue
+    fi
+
+    type=$(jq -r '.type // ""' <<<"$payload" 2>/dev/null)
+    case $type in
+    set-theme)
+      name=$(jq -r '.name // ""' <<<"$payload" 2>/dev/null)
+      apply_theme "$name" "$id"
+      ;;
+    install-theme)
+      install_theme "$id" "$payload"
+      ;;
+    *)
+      # Explicit resync (or the original empty-object request).
+      emit_palette
+      ;;
+    esac
+  done
+
+  kill -TERM "$MAIN_PID" 2>/dev/null
+}
+
+MAIN_PID=$$
+trap 'exit 0' TERM INT
+
+main() {
+  # Push once up front so a freshly connected extension has the palette without
+  # waiting for the next theme switch.
+  emit_palette
+
+  read_requests <&0 &
+
+  # omarchy-theme-set replaces the theme directory wholesale (rm -rf + mv), so a
+  # watch on colors.toml would follow the deleted inode and go deaf after one
+  # switch. Watching the parent survives the swap.
+  mkdir -p "$STATE_DIR" 2>/dev/null
+
+  # inotifywait prints "<dir> <events> <filename>". Filtering on the filename
+  # matters: omarchy-theme-set stages into next-theme, which lives inside this
+  # same directory, so an unfiltered watch fires repeatedly during staging and
+  # pushes the *old* palette before the swap has happened.
+  local file
+  while read -r _ _ file; do
+    case $file in
+    theme | theme.name) ;;
+    *) continue ;;
+    esac
+
+    # rm -rf, mv, and the theme.name write arrive as a burst; coalesce it so the
+    # extension gets one update per theme switch and never reads a half-swap.
+    while read -r -t 0.2 _ _ _; do :; done
+    emit_palette
+  done < <(inotifywait -m -q -e create,moved_to,close_write,delete,move_self "$STATE_DIR" 2>/dev/null)
+
+  # inotifywait died (or was never available). Keep the port open so the browser
+  # keeps the palette it already has instead of tearing the connection down.
+  wait
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
