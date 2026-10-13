@@ -11,6 +11,7 @@
 /coverage/
 /.cache/
 /dist/
+/web-ext-artifacts/
 *.xpi
 *.zip
 *.log

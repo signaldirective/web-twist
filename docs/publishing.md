@@ -39,6 +39,50 @@ That has two consequences worth stating plainly, in the listing and to reviewers
    export AMO_JWT_SECRET='…'
    ```
 
+## Sign
+
+Mozilla signs the add-on; you never hold a signing key of your own. Both channels
+below use the same credentials and the same package (the contents of `extension/`
+with `manifest.json` at its root, which `web-ext` assembles for you). `web-ext` 8
+or newer signs and submits both channels from the command line; `npx` fetches
+that for you.
+
+### Self-distributed (unlisted): a signed XPI you host
+
+```bash
+npx web-ext@latest sign --source-dir extension --channel unlisted \
+  --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"
+```
+
+The signed file lands in `web-ext-artifacts/`, named like
+`webtwist-1.0-an+fx.xpi`. Hand that file out; users install it with `about:addons`
+→ gear → **Install Add-on From File**, or by opening the file directly.
+
+To install it from a web page, serve the file with
+`Content-Type: application/x-xpinstall` and link to it from a top-level page.
+Don't use `InstallTrigger`; Firefox removed it in 144.
+
+A self-distributed add-on does **not** auto-update by itself. Firefox checks the
+manifest's `update_url` if you set `browser_specific_settings.gecko.update_url`,
+and otherwise checks AMO for a *listed* update. So either host an update manifest,
+or also list the add-on (below).
+
+### Listed on AMO: the store
+
+```bash
+npx web-ext@latest sign --source-dir extension --channel listed \
+  --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"
+```
+
+Or upload the package from the developer hub and fill in the listing there. Once
+approved it installs with one click, and Firefox updates it automatically.
+
+### Every upload
+
+AMO rejects a version that already exists for the add-on, so bump `version` in
+`extension/manifest.json` before each sign or submit. The signature is bound to
+the add-on id, so changing the id means a new listing.
+
 ## Listing copy
 
 Fill these in on the listing page. The description is deliberately explicit about
