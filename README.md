@@ -240,7 +240,7 @@ installed or the helper's rate-limit state.
 
 ## Credits
 
-Thanks to Discord user **anom**, for inspiring me to actually get around to
+Thanks to Discord user **anom** [atif-1402](https://atif-1402.github.io), for inspiring me to actually get around to
 making this.
 
 ## License
