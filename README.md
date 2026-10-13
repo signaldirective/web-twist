@@ -200,6 +200,7 @@ is loaded straight from `extension/`, so there is nothing to build.
 | `extension/` | Add-on: palette bridge, page API, auto-theme engine, popup, bundled presets |
 | `bin/webtwist-host` | Local helper that reads and applies themes |
 | `styles/` | Starter Stylus userstyle |
+| `assets/` | Icon source (`icon.svg`) and the rendered PNG |
 | `install.sh` | Native host registration and removal |
 | `tests/` | Behavior and security regression tests |
 | `docs/publishing.md` | AMO listing and submission runbook |
@@ -248,5 +249,7 @@ making this.
 check the rights for those images before reusing them.
 
 The icon is an original drawing of a cuttlefish — camouflage and colour change,
-for a browser that takes on your theme. Its vector source is `assets/icon.svg`,
-and it is covered by this project's MIT license.
+for a browser that takes on your theme. The vector source is `assets/icon.svg`,
+the rendered 128×128 PNG is `assets/icon-128.png`, and the copy the add-on loads
+is `extension/icon.png`. `assets/render.sh` regenerates both from the SVG, and
+all of it is covered by this project's MIT license.
