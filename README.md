@@ -247,6 +247,6 @@ making this.
 [MIT](LICENSE). Externally hosted wallpapers are not covered by this license;
 check the rights for those images before reusing them.
 
-The extension icon uses the square logo from the
-[official Omarchy brand assets](https://omarchy.org/brand). The logo is not
-covered by this project's MIT license.
+The icon is an original drawing of a cuttlefish — camouflage and colour change,
+for a browser that takes on your theme. Its vector source is `assets/icon.svg`,
+and it is covered by this project's MIT license.
